@@ -1,0 +1,773 @@
+
+#include <WiFiClientSecure.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "time.h"
+
+// WiFi credentials
+const char* ssid = "Siuuuu";
+const char* password = "1234567890";
+
+// for time and date
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // For IST (GMT+5:30), use 19800 seconds
+const int daylightOffset_sec = 0;
+
+// Cloudinary API
+const char* cloudinary_host = "api.cloudinary.com";
+const int cloudinary_port = 443; // HTTPS
+const char* cloudinary_path = "/v1_1/ql01n202/image/upload";
+const char* upload_preset = "smart_doorbell";
+
+// Firestore settings
+// Firebase configuration
+const char* firebase_api_key = "AIzaSyA3sfTXIn9i9ZPci84QDJrCHN0vsB6K12E";
+
+const char* firebase_email = "lunkadaarav@gmail.com";
+const char* firebase_password = "c@25138065A1";
+
+const char* firestore_url =
+"https://firestore.googleapis.com/v1/projects/smartdoorbellsecurity/databases/(default)/documents/visitors?key=AIzaSyA3sfTXIn9i9ZPci84QDJrCHN0vsB6K12E";
+
+// Remote "trigger capture" command + heartbeat written by the web dashboard /
+// read by the device. "lastSeen" lets the dashboard show online/offline.
+const char* command_doc_url =
+"https://firestore.googleapis.com/v1/projects/smartdoorbellsecurity/databases/(default)/documents/commands/smartdoorbell01?key=AIzaSyA3sfTXIn9i9ZPci84QDJrCHN0vsB6K12E";
+const char* command_heartbeat_url =
+"https://firestore.googleapis.com/v1/projects/smartdoorbellsecurity/databases/(default)/documents/commands/smartdoorbell01?updateMask.fieldPaths=lastSeen&key=AIzaSyA3sfTXIn9i9ZPci84QDJrCHN0vsB6K12E";
+const char* command_heartbeat_reset_url =
+"https://firestore.googleapis.com/v1/projects/smartdoorbellsecurity/databases/(default)/documents/commands/smartdoorbell01?updateMask.fieldPaths=lastSeen&updateMask.fieldPaths=triggerCapture&key=AIzaSyA3sfTXIn9i9ZPci84QDJrCHN0vsB6K12E";
+const unsigned long COMMAND_POLL_INTERVAL_MS = 5000;
+
+// Periodic "timelapse" snapshot so the dashboard can show a last-24-hours
+// timeline even on quiet days with no button presses. The dashboard prunes
+// anything older than 24h, so the device doesn't need to manage retention.
+const unsigned long TIMELAPSE_INTERVAL_MS = 3UL * 60UL * 1000UL; // every 3 min
+
+// Firebase ID tokens are valid for 1 hour; re-authenticating on every poll
+// is slow and wastes requests, so we cache the token and only refresh it
+// before it expires.
+String cachedIdToken = "";
+unsigned long idTokenFetchedAtMs = 0;
+const unsigned long ID_TOKEN_TTL_MS = 50UL * 60UL * 1000UL;
+
+
+#define BUTTON_PIN 14
+bool lastButtonState = HIGH;
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+
+// Global variables to reduce stack usage
+WiFiClientSecure client;
+camera_fb_t* fb = nullptr;
+String cloudinaryResponse = "";
+
+// Shared across setup()/loop() so only one capture runs at a time, whatever
+// triggered it (boot, the physical button, or the dashboard).
+volatile bool captureInProgress = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Starting ESP32 Camera...");
+ 
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiAttempts++;
+  }
+ 
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi connection failed! Restarting...");
+    ESP.restart();
+  }
+ 
+  Serial.println("\nWiFi connected!");
+
+  // Initialize camera with minimal settings
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = 5;
+  config.pin_d1 = 18;
+  config.pin_d2 = 19;
+  config.pin_d3 = 21;
+  config.pin_d4 = 36;
+  config.pin_d5 = 39;
+  config.pin_d6 = 34;
+  config.pin_d7 = 35;
+  config.pin_xclk = 0;
+  config.pin_pclk = 22;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+  config.pin_sscb_sda = 26;
+  config.pin_sscb_scl = 27;
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+ 
+  // Use very conservative settings to avoid memory issues
+  if (psramFound()) {
+    Serial.println("PSRAM found");
+    config.frame_size = FRAMESIZE_VGA;    // Medium size
+    config.jpeg_quality = 10;             // Good quality
+    config.fb_count = 1;                  // Single buffer
+  } else {
+    Serial.println("PSRAM not found - using minimal settings");
+    config.frame_size = FRAMESIZE_SVGA;   // Smaller size
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+ 
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println(" Camera init failed");
+    delay(1000);
+    ESP.restart();
+  } else {
+    Serial.println("Camera initialized");
+  }
+
+// Configure time using NTP
+Serial.println("Starting NTP time synchronization...");
+
+configTime(
+  gmtOffset_sec,
+  daylightOffset_sec,
+  ntpServer,
+  "time.google.com"
+);
+
+struct tm timeinfo;
+bool timeSynced = false;
+
+for (int attempt = 0; attempt < 30; attempt++) {
+  if (getLocalTime(&timeinfo, 1000)) {
+    int year = timeinfo.tm_year + 1900;
+
+    if (year >= 2024) {
+      timeSynced = true;
+      break;
+    }
+  }
+
+  Serial.print(".");
+  delay(500);
+}
+
+Serial.println();
+
+if (timeSynced) {
+  Serial.println("Time synchronized successfully!");
+  Serial.print("Local time: ");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+} else {
+  Serial.println("ERROR: NTP synchronization failed!");
+  Serial.println("Restarting in 5 seconds. Check Wi-Fi internet access.");
+
+  delay(5000);
+  ESP.restart();
+}
+ Serial.println("Setup complete!");
+Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+
+// Wait briefly for Wi-Fi and time synchronization to settle
+delay(3000);
+
+// Automatically capture and upload one image
+Serial.println("Automatic capture starting...");
+
+captureInProgress = true;
+xTaskCreate(
+  captureAndUploadTask,
+  "upload_task",
+  8192,
+  (void*) "boot",
+  1,
+  NULL
+);
+  }
+
+// Function to get current time in RFC 3339 format for Firestore
+String getFirestoreTimestamp() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 5000)) {
+    Serial.println("ERROR: Unable to obtain synchronized time.");
+    return "";
+  }
+
+  int year = timeinfo.tm_year + 1900;
+
+  if (year < 2024) {
+    Serial.println("ERROR: Invalid system date.");
+    return "";
+  }
+
+  time_t now;
+  time(&now);
+
+  struct tm utcTime;
+  gmtime_r(&now, &utcTime);
+
+  char timeString[25];
+
+  strftime(
+    timeString,
+    sizeof(timeString),
+    "%Y-%m-%dT%H:%M:%SZ",
+    &utcTime
+  );
+
+  return String(timeString);
+}
+void printLocalTime() {
+  Serial.println(getFirestoreTimestamp());
+}
+
+void loop() {
+  static unsigned long lastPoll = 0;
+  static unsigned long lastDebounceTime = 0;
+  static unsigned long lastTimelapse = 0;
+  unsigned long now = millis();
+
+  // Physical doorbell button - press it just like a real Ring button.
+  bool buttonReading = digitalRead(BUTTON_PIN);
+  if (buttonReading != lastButtonState) {
+    lastDebounceTime = now;
+  }
+  if (now - lastDebounceTime > BUTTON_DEBOUNCE_MS) {
+    bool pressedEdge = (buttonReading == LOW && lastButtonState == HIGH);
+    if (pressedEdge && !captureInProgress) {
+      Serial.println("Doorbell button pressed");
+      captureInProgress = true;
+      xTaskCreate(
+        captureAndUploadTask,
+        "upload_task",
+        8192,
+        (void*) "button",
+        1,
+        NULL
+      );
+    }
+  }
+  lastButtonState = buttonReading;
+
+  // Remote "Capture now" request from the web dashboard.
+  if (!captureInProgress &&
+      WiFi.status() == WL_CONNECTED &&
+      now - lastPoll >= COMMAND_POLL_INTERVAL_MS) {
+    lastPoll = now;
+
+    if (checkRemoteCaptureTrigger()) {
+      Serial.println("Remote capture requested from dashboard");
+      captureInProgress = true;
+      xTaskCreate(
+        captureAndUploadTask,
+        "upload_task",
+        8192,
+        (void*) "remote",
+        1,
+        NULL
+      );
+    }
+  }
+
+  // Periodic timelapse snapshot for the 24h timeline view.
+  if (!captureInProgress &&
+      WiFi.status() == WL_CONNECTED &&
+      now - lastTimelapse >= TIMELAPSE_INTERVAL_MS) {
+    lastTimelapse = now;
+    captureInProgress = true;
+    xTaskCreate(
+      captureAndUploadTask,
+      "upload_task",
+      8192,
+      (void*) "timelapse",
+      1,
+      NULL
+    );
+  }
+
+  delay(50);
+}
+
+// Returns a valid Firebase ID token, reusing the cached one until it is
+// close to expiring instead of signing in again on every poll.
+String ensureIdToken() {
+  unsigned long now = millis();
+  bool expired = (cachedIdToken.length() == 0) ||
+                 (now - idTokenFetchedAtMs > ID_TOKEN_TTL_MS);
+
+  if (expired) {
+    String token = getFirebaseIdToken();
+    cachedIdToken = token;
+    idTokenFetchedAtMs = now;
+  }
+
+  return cachedIdToken;
+}
+
+// Polls the "commands/smartdoorbell01" Firestore document the web dashboard
+// writes to, and refreshes our heartbeat so the dashboard can show the
+// device as online. Returns true (and clears the flag) if a capture was
+// requested.
+bool checkRemoteCaptureTrigger() {
+  String idToken = ensureIdToken();
+  if (idToken.length() == 0) {
+    return false;
+  }
+
+  WiFiClientSecure commandClient;
+  commandClient.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(commandClient, command_doc_url)) {
+    return false;
+  }
+  http.addHeader("Authorization", "Bearer " + idToken);
+
+  int httpCode = http.GET();
+
+  if (httpCode == 401) {
+    // Cached token was rejected (expired/revoked) - force a fresh sign-in.
+    http.end();
+    cachedIdToken = "";
+    idToken = ensureIdToken();
+    if (idToken.length() == 0) {
+      return false;
+    }
+    if (!http.begin(commandClient, command_doc_url)) {
+      return false;
+    }
+    http.addHeader("Authorization", "Bearer " + idToken);
+    httpCode = http.GET();
+  }
+
+  if (httpCode != 200) {
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, response)) {
+    return false;
+  }
+
+  bool shouldCapture =
+      doc["fields"]["triggerCapture"]["booleanValue"] | false;
+
+  sendHeartbeat(idToken, shouldCapture);
+
+  return shouldCapture;
+}
+
+// Updates "lastSeen" so the dashboard can tell the device is online, and
+// clears triggerCapture in the same request when a capture was just honored.
+void sendHeartbeat(const String& idToken, bool resetTrigger) {
+  String timestamp = getFirestoreTimestamp();
+  if (timestamp.length() == 0) {
+    return;
+  }
+
+  WiFiClientSecure heartbeatClient;
+  heartbeatClient.setInsecure();
+
+  HTTPClient http;
+  const char* url =
+      resetTrigger ? command_heartbeat_reset_url : command_heartbeat_url;
+
+  if (!http.begin(heartbeatClient, url)) {
+    return;
+  }
+  http.addHeader("Authorization", "Bearer " + idToken);
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument doc(256);
+  doc["fields"]["lastSeen"]["timestampValue"] = timestamp;
+  if (resetTrigger) {
+    doc["fields"]["triggerCapture"]["booleanValue"] = false;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  http.sendRequest("PATCH", payload.c_str());
+  http.end();
+}
+
+void captureAndUploadTask(void *parameter) {
+  const char* trigger = (const char*) parameter;
+  Serial.printf("📷 Starting capture task (trigger: %s)...\n", trigger);
+
+  // Capture image
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    captureInProgress = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  Serial.printf("Image captured: %u bytes\n", fb->len);
+
+  if (fb->len < 1000) {
+    Serial.println("Image too small");
+    esp_camera_fb_return(fb);
+    captureInProgress = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Upload to Cloudinary
+  String imageUrl = uploadToCloudinary();
+
+  // Free camera buffer
+  esp_camera_fb_return(fb);
+  fb = nullptr;
+
+  if (imageUrl.length() > 0) {
+    // Upload to Firestore
+    uploadToFirestore(imageUrl, trigger);
+  }
+
+  Serial.println("Task completed");
+  Serial.printf("Free heap after task: %d bytes\n", ESP.getFreeHeap());
+
+  captureInProgress = false;
+
+  // Delete this task
+  vTaskDelete(NULL);
+}
+
+String uploadToCloudinary() {
+  Serial.println("🔧 Upload settings:");
+  Serial.println("  Host: " + String(cloudinary_host));
+  Serial.println("  Path: " + String(cloudinary_path));
+  Serial.println("  Preset: " + String(upload_preset));
+ 
+  client.setInsecure();
+  client.setTimeout(20000); // 20 second timeout
+ 
+  Serial.println(" Connecting to Cloudinary...");
+  if (!client.connect(cloudinary_host, cloudinary_port)) {
+    Serial.println("Connection failed");
+    return "";
+  }
+ 
+  Serial.println(" Connected to Cloudinary");
+
+  // This is for Preparing multipart form data
+  String boundary = "----ESP32Boundary";
+  String header = "--" + boundary + "\r\n"
+                 "Content-Disposition: form-data; name=\"upload_preset\"\r\n\r\n" +
+                 String(upload_preset) + "\r\n--" + boundary + "\r\n"
+                 "Content-Disposition: form-data; name=\"file\"; filename=\"image.jpg\"\r\n"
+                 "Content-Type: image/jpeg\r\n\r\n";
+ 
+  String footer = "\r\n--" + boundary + "--\r\n";
+  size_t contentLength = header.length() + fb->len + footer.length();
+ 
+  // Send HTTP request
+  client.println("POST " + String(cloudinary_path) + " HTTP/1.1");
+  client.println("Host: " + String(cloudinary_host));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(contentLength));
+  client.println();
+ 
+  // Send header
+  client.print(header);
+ 
+  // Here we Send image data in small chunks
+  const size_t chunkSize = 1024;
+  for (size_t i = 0; i < fb->len; i += chunkSize) {
+    size_t len = min(chunkSize, fb->len - i);
+    client.write(fb->buf + i, len);
+    vTaskDelay(1 / portTICK_PERIOD_MS); // Yield to other tasks
+  }
+ 
+  // Send footer
+  client.print(footer);
+ 
+  Serial.println("Data sent, waiting for response...");
+ 
+  // Wait for the HTTP response
+unsigned long timeout = millis();
+
+while (!client.available() && millis() - timeout < 20000) {
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+}
+
+if (!client.available()) {
+  Serial.println("Cloudinary response timeout");
+  client.stop();
+  return "";
+}
+
+// Read HTTP status line
+String responseStatusLine = client.readStringUntil('\n');
+responseStatusLine.trim();
+
+Serial.println("Cloudinary HTTP status: " + responseStatusLine);
+
+if (!responseStatusLine.startsWith("HTTP/1.1 200") &&
+    !responseStatusLine.startsWith("HTTP/1.1 201") &&
+    !responseStatusLine.startsWith("HTTP/1.0 200") &&
+    !responseStatusLine.startsWith("HTTP/1.0 201")) {
+  Serial.println("Cloudinary returned an HTTP error");
+
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      Serial.println(client.readStringUntil('\n'));
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+
+  client.stop();
+  return "";
+}
+
+// Skip HTTP headers
+// Read HTTP headers and detect response format
+int responseContentLength = -1;
+bool chunked = false;
+
+while (client.connected() || client.available()) {
+  String line = client.readStringUntil('\n');
+  line.trim();
+
+  if (line.length() == 0) {
+    break;
+  }
+
+  if (line.startsWith("Content-Length:")) {
+    responseContentLength = line.substring(15).toInt();
+  }
+
+  if (line.startsWith("Transfer-Encoding:") &&
+      line.indexOf("chunked") >= 0) {
+    chunked = true;
+  }
+
+  vTaskDelay(1 / portTICK_PERIOD_MS);
+}
+
+// Read the response body
+cloudinaryResponse = "";
+
+if (chunked) {
+  while (client.connected() || client.available()) {
+    String sizeLine = client.readStringUntil('\n');
+    sizeLine.trim();
+
+    int chunkSize = strtol(sizeLine.c_str(), NULL, 16);
+
+    if (chunkSize <= 0) {
+      // Consume the final empty line
+      client.readStringUntil('\n');
+      break;
+    }
+
+    int bytesRead = 0;
+    unsigned long chunkStart = millis();
+
+    while (bytesRead < chunkSize &&
+           millis() - chunkStart < 15000) {
+
+      while (client.available() && bytesRead < chunkSize) {
+        cloudinaryResponse += (char)client.read();
+        bytesRead++;
+      }
+
+      if (bytesRead < chunkSize) {
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+      }
+    }
+
+    if (bytesRead != chunkSize) {
+      Serial.println("Incomplete HTTP chunk");
+      client.stop();
+      return "";
+    }
+
+    // Consume CRLF after the chunk
+    client.readStringUntil('\n');
+  }
+
+} else if (responseContentLength >= 0) {
+  unsigned long start = millis();
+
+  while (cloudinaryResponse.length() < responseContentLength &&
+         millis() - start < 15000) {
+
+    while (client.available() &&
+           cloudinaryResponse.length() < responseContentLength) {
+      cloudinaryResponse += (char)client.read();
+    }
+
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+}
+
+client.stop();
+
+Serial.println("Cloudinary JSON response:");
+Serial.println(cloudinaryResponse);
+
+  // Parse JSON response
+  DynamicJsonDocument doc(1024);
+
+DeserializationError error =
+    deserializeJson(doc, cloudinaryResponse);
+
+if (error) {
+  Serial.println(
+      "JSON parse error: " + String(error.c_str())
+  );
+  return "";
+}
+
+if (!doc.containsKey("secure_url")) {
+  Serial.println("No secure_url in response");
+  return "";
+}
+
+String url = doc["secure_url"].as<String>();
+
+Serial.println("Image uploaded: " + url);
+
+return url;
+  }
+String getFirebaseIdToken() {
+  Serial.println("Signing in to Firebase...");
+
+  WiFiClientSecure authClient;
+  authClient.setInsecure();  // Testing only; see security note below
+
+  HTTPClient http;
+
+  String authUrl =
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key="
+    + String(firebase_api_key);
+
+  if (!http.begin(authClient, authUrl)) {
+    Serial.println("Could not start Firebase authentication request");
+    return "";
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument requestDoc(512);
+
+  requestDoc["email"] = firebase_email;
+  requestDoc["password"] = firebase_password;
+  requestDoc["returnSecureToken"] = true;
+
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
+
+  int httpCode = http.POST(requestBody);
+
+  String response = http.getString();
+
+  http.end();
+
+  if (httpCode != 200) {
+    Serial.printf("Firebase login failed: HTTP %d\n", httpCode);
+    Serial.println(response);
+    return "";
+  }
+
+  DynamicJsonDocument responseDoc(2048);
+
+  DeserializationError error =
+    deserializeJson(responseDoc, response);
+
+  if (error) {
+    Serial.println("Could not parse Firebase login response");
+    return "";
+  }
+
+  if (responseDoc["idToken"].isNull()) {
+    Serial.println("Firebase response did not contain an ID token");
+    return "";
+  }
+
+  String idToken = responseDoc["idToken"].as<String>();
+
+  Serial.println("Firebase authentication successful");
+
+  return idToken;
+}
+void uploadToFirestore(String imageUrl, const char* trigger) {
+  Serial.println("Uploading to Firestore...");
+
+  // Authenticate with Firebase first (reuses the cached token when valid)
+  String idToken = ensureIdToken();
+
+  if (idToken.length() == 0) {
+    Serial.println("Firestore upload cancelled: authentication failed");
+    return;
+  }
+
+  WiFiClientSecure firestoreClient;
+  firestoreClient.setInsecure();  // Testing only; see security note below
+
+  HTTPClient http;
+
+  if (!http.begin(firestoreClient, firestore_url)) {
+    Serial.println("Could not start Firestore request");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + idToken);
+
+  // Construct the Firestore document
+  DynamicJsonDocument doc(1024);
+
+  JsonObject fields = doc.createNestedObject("fields");
+
+String timestamp = getFirestoreTimestamp();
+if (timestamp.length() == 0) {
+  Serial.println("Firestore upload cancelled: invalid timestamp.");
+  return;
+}
+
+Serial.println("Timestamp being uploaded: " + timestamp);
+
+fields["deviceId"]["stringValue"] = "smartdoorbell01";
+fields["imageUrl"]["stringValue"] = imageUrl;
+fields["timestamp"]["timestampValue"] = timestamp;
+fields["trigger"]["stringValue"] = trigger;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("Sending visitor record to Firestore...");
+
+  int httpCode = http.POST(payload);
+
+  String response = http.getString();
+
+  Serial.printf("Firestore response: %d\n", httpCode);
+
+  if (httpCode == 200) {
+    Serial.println("Visitor record saved successfully!");
+  } else {
+    Serial.println("Firestore upload failed");
+    Serial.println(response);
+  }
+
+  http.end();
+}

@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Visitor photos + timestamps, written by the ESP32 and read by the dashboard.
+    match /visitors/{visitorId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Remote "trigger capture" flag + device heartbeat.
+    match /commands/{deviceId} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
